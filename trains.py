@@ -1,217 +1,303 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 # Author: kerlomz <kerlomz@gmail.com>
-import time
-import random
-import logging
-import numpy as np
 import tensorflow as tf
-import framework
+tf.compat.v1.disable_v2_behavior()
+tf.compat.v1.disable_eager_execution()
+try:
+    gpus = tf.config.list_physical_devices('GPU')
+    tf.config.experimental.set_memory_growth(gpus[0], True)
+
+except Exception as e:
+    print(e, "No available gpu found.")
+from tensorflow.python.platform.build_info import build_info
+import core
 import utils
+import utils.data
+import validation
 from config import *
-from tensorflow.python.framework.graph_util import convert_variables_to_constants
+from tf_graph_util import convert_variables_to_constants
 from PIL import ImageFile
+# if build_info['cuda_version'] == '64_110':
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-logger = logging.getLogger('Training for OCR using {}+{}+CTC'.format(NEU_CNN, NEU_RECURRENT))
-logger.setLevel(logging.INFO)
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
 
 
-def compile_graph(acc):
-    input_graph = tf.Graph()
-    sess = tf.Session(graph=input_graph)
+class Trains:
 
-    with sess.graph.as_default():
-        model = framework.GraphOCR(
-            RunMode.Predict,
-            NETWORK_MAP[NEU_CNN],
-            NETWORK_MAP[NEU_RECURRENT]
+    stop_flag: bool = False
+    """训练任务的类"""
+
+    def __init__(self, model_conf: ModelConfig):
+        """
+        :param model_conf: 读取工程配置文件
+        """
+        self.model_conf = model_conf
+        self.validation = validation.Validation(self.model_conf)
+
+    def compile_graph(self, acc):
+        """
+        编译当前准确率下对应的计算图为pb模型，准确率仅作为模型命名的一部分
+        :param acc: 准确率
+        :return:
+        """
+        input_graph = tf.compat.v1.Graph()
+        tf.compat.v1.keras.backend.clear_session()
+        tf.compat.v1.reset_default_graph()
+        predict_sess = tf.compat.v1.Session(graph=input_graph)
+        tf.compat.v1.keras.backend.set_session(predict_sess)
+
+        with predict_sess.graph.as_default():
+            model = core.NeuralNetwork(
+                model_conf=self.model_conf,
+                mode=RunMode.Predict,
+                backbone=self.model_conf.neu_cnn,
+                recurrent=self.model_conf.neu_recurrent
+            )
+            model.build_graph()
+            model.build_train_op()
+            input_graph_def = predict_sess.graph.as_graph_def()
+            saver = tf.compat.v1.train.Saver(var_list=tf.compat.v1.global_variables())
+            tf.compat.v1.logging.info(tf.train.latest_checkpoint(self.model_conf.model_root_path))
+            saver.restore(predict_sess, tf.train.latest_checkpoint(self.model_conf.model_root_path))
+
+            output_graph_def = convert_variables_to_constants(
+                predict_sess,
+                input_graph_def,
+                output_node_names=['dense_decoded']
+            )
+
+        if not os.path.exists(self.model_conf.compile_model_path):
+            os.makedirs(self.model_conf.compile_model_path)
+
+        last_compile_model_path = (
+            os.path.join(self.model_conf.compile_model_path, "{}.pb".format(self.model_conf.model_name))
+        ).replace('.pb', '_{}.pb'.format(int(acc * 10000)))
+
+        self.model_conf.output_config(target_model_name="{}_{}".format(self.model_conf.model_name, int(acc * 10000)))
+        with tf.io.gfile.GFile(last_compile_model_path, mode='wb') as gf:
+            gf.write(output_graph_def.SerializeToString())
+
+        # if build_info['cuda_version'] == '64_110' and self.model_conf.neu_recurrent not in [
+        #     RecurrentNetwork.BiLSTM,
+        #     RecurrentNetwork.BiGRU,
+        #     RecurrentNetwork.BiLSTMcuDNN,
+        # ]:
+        #     self.compile_onnx(predict_sess, output_graph_def, last_compile_model_path, self.model_conf.loss_func)
+        # if self.model_conf.neu_recurrent == RecurrentNetwork.NoRecurrent:
+        #     self.compile_tflite(last_compile_model_path)
+
+    def achieve_cond(self, acc, cost, epoch):
+        achieve_accuracy = acc >= self.model_conf.trains_end_acc
+        achieve_cost = cost <= self.model_conf.trains_end_cost
+        achieve_epochs = epoch >= self.model_conf.trains_end_epochs
+        over_epochs = epoch > 10000
+        if (achieve_accuracy and achieve_epochs and achieve_cost) or over_epochs:
+            return True
+        return False
+
+    def init_captcha_gennerator(self, ran_captcha):
+
+        path = self.model_conf.da_random_captcha['FontPath']
+        if not os.path.exists(path):
+            exception("Font path does not exist.", code=-6754)
+        items = os.listdir(path)
+        fonts = [os.path.join(path, item) for item in items]
+        ran_captcha.sample = NUMBER + ALPHA_UPPER + ALPHA_LOWER
+        ran_captcha.fonts_list = fonts
+        ran_captcha.check_font()
+        ran_captcha.rgb_r = [0, 255]
+        ran_captcha.rgb_g = [0, 255]
+        ran_captcha.rgb_b = [0, 255]
+        ran_captcha.fonts_num = [4, 8]
+
+    def train_process(self):
+        """
+        训练任务
+        :return:
+        """
+        # 输出重要的配置参数
+        self.model_conf.println()
+        # 定义网络结构
+        model = core.NeuralNetwork(
+            mode=RunMode.Trains,
+            model_conf=self.model_conf,
+            backbone=self.model_conf.neu_cnn,
+            recurrent=self.model_conf.neu_recurrent
         )
         model.build_graph()
-        input_graph_def = sess.graph.as_graph_def()
-        saver = tf.train.Saver(var_list=tf.global_variables())
-        logger.info(tf.train.latest_checkpoint(MODEL_PATH))
-        saver.restore(sess, tf.train.latest_checkpoint(MODEL_PATH))
 
-    output_graph_def = convert_variables_to_constants(
-        sess,
-        input_graph_def,
-        output_node_names=['dense_decoded']
-    )
-
-    last_compile_model_path = COMPILE_MODEL_PATH.replace('.pb', '_{}.pb'.format(int(acc * 10000)))
-    with tf.gfile.GFile(last_compile_model_path, mode='wb') as gf:
-        gf.write(output_graph_def.SerializeToString())
-
-    generate_config(acc)
-
-
-def train_process(mode=RunMode.Trains):
-    model = framework.GraphOCR(mode, NETWORK_MAP[NEU_CNN], NETWORK_MAP[NEU_RECURRENT])
-    model.build_graph()
-
-    print('Loading Trains DataSet...')
-    train_feeder = utils.DataIterator(mode=RunMode.Trains)
-    if TRAINS_USE_TFRECORDS:
-        train_feeder.read_sample_from_tfrecords(TRAINS_PATH)
-        print('Loading Test DataSet...')
-        test_feeder = utils.DataIterator(mode=RunMode.Test)
-        test_feeder.read_sample_from_tfrecords(TEST_PATH)
-    else:
-        if isinstance(TRAINS_PATH, list):
-            origin_list = []
-            for trains_path in TRAINS_PATH:
-                origin_list += [os.path.join(trains_path, trains) for trains in os.listdir(trains_path)]
-        else:
-            origin_list = [os.path.join(TRAINS_PATH, trains) for trains in os.listdir(TRAINS_PATH)]
-        random.shuffle(origin_list)
-        if not HAS_TEST_SET:
-            test_list = origin_list[:TEST_SET_NUM]
-            trains_list = origin_list[TEST_SET_NUM:]
-        else:
-            if isinstance(TEST_PATH, list):
-                test_list = []
-                for test_path in TEST_PATH:
-                    test_list += [os.path.join(test_path, test) for test in os.listdir(test_path)]
-            else:
-                test_list = [os.path.join(TEST_PATH, test) for test in os.listdir(TEST_PATH)]
-            random.shuffle(test_list)
-            trains_list = origin_list
-        train_feeder.read_sample_from_files(trains_list)
-        print('Loading Test DataSet...')
-        test_feeder = utils.DataIterator(mode=RunMode.Test)
-        test_feeder.read_sample_from_files(test_list)
-
-    print('Total {} Trains DataSets'.format(train_feeder.size))
-    print('Total {} Test DataSets'.format(test_feeder.size))
-    if test_feeder.size >= train_feeder.size:
-        exception("The number of training sets cannot be less than the test set.", )
-
-    num_train_samples = train_feeder.size
-    num_test_samples = test_feeder.size
-    if num_test_samples < TEST_BATCH_SIZE:
-        exception(
-            "The number of test sets cannot be less than the test batch size.",
-            ConfigException.INSUFFICIENT_SAMPLE
+        tf.compat.v1.logging.info('Loading Trains DataSet...')
+        train_feeder = utils.data.DataIterator(
+            model_conf=self.model_conf, mode=RunMode.Trains
         )
-    num_batches_per_epoch = int(num_train_samples / BATCH_SIZE)
+        train_feeder.read_sample_from_tfrecords(self.model_conf.trains_path[DatasetType.TFRecords])
 
-    config = tf.ConfigProto(
-        # allow_soft_placement=True,
-        log_device_placement=False,
-        gpu_options=tf.GPUOptions(
-            allocator_type='BFC',
-            allow_growth=True,  # it will cause fragmentation.
-            per_process_gpu_memory_fraction=GPU_USAGE)
-    )
-    accuracy = 0
-    epoch_count = 1
+        tf.compat.v1.logging.info('Loading Validation DataSet...')
+        validation_feeder = utils.data.DataIterator(
+            model_conf=self.model_conf, mode=RunMode.Validation
+        )
+        validation_feeder.read_sample_from_tfrecords(self.model_conf.validation_path[DatasetType.TFRecords])
 
-    with tf.Session(config=config) as sess:
-        init_op = tf.global_variables_initializer()
+        tf.compat.v1.logging.info('Total {} Trains DataSets'.format(train_feeder.size))
+        tf.compat.v1.logging.info('Total {} Validation DataSets'.format(validation_feeder.size))
+        if validation_feeder.size >= train_feeder.size:
+            exception("The number of training sets cannot be less than the validation set.", )
+        if validation_feeder.size < self.model_conf.validation_batch_size:
+            exception("The number of validation sets cannot be less than the validation batch size.", )
+
+        num_train_samples = train_feeder.size
+        num_validation_samples = validation_feeder.size
+
+        if num_validation_samples < self.model_conf.validation_batch_size:
+            self.model_conf.validation_batch_size = num_validation_samples
+            tf.compat.v1.logging.warn(
+                'The number of validation sets is less than the validation batch size, '
+                'will use validation set size as validation batch size.'.format(validation_feeder.size))
+
+        num_batches_per_epoch = int(num_train_samples / self.model_conf.batch_size)
+
+        model.build_train_op(num_train_samples)
+
+        # 会话配置
+        sess_config = tf.compat.v1.ConfigProto(
+            allow_soft_placement=True,
+            # log_device_placement=False,
+            gpu_options=tf.compat.v1.GPUOptions(
+                allocator_type='BFC',
+                allow_growth=True,  # it will cause fragmentation.
+                # per_process_gpu_memory_fraction=0.3
+            )
+        )
+        accuracy = 0
+        epoch_count = 1
+
+        if num_train_samples < 500:
+            save_step = 10
+            trains_validation_steps = 50
+
+        else:
+            save_step = 100
+            trains_validation_steps = self.model_conf.trains_validation_steps
+
+        sess = tf.compat.v1.Session(config=sess_config)
+
+        init_op = tf.compat.v1.global_variables_initializer()
         sess.run(init_op)
+        saver = tf.compat.v1.train.Saver(var_list=tf.compat.v1.global_variables(), max_to_keep=2)
+        train_writer = tf.compat.v1.summary.FileWriter('logs', sess.graph)
+        # try:
+        checkpoint_state = tf.train.get_checkpoint_state(self.model_conf.model_root_path)
+        if checkpoint_state and checkpoint_state.model_checkpoint_path:
+            # 加载被中断的训练任务
+            saver.restore(sess, checkpoint_state.model_checkpoint_path)
 
-        saver = tf.train.Saver(tf.global_variables(), max_to_keep=2)
-        train_writer = tf.summary.FileWriter('logs', sess.graph)
-        try:
-            saver.restore(sess, tf.train.latest_checkpoint(MODEL_PATH))
-        except ValueError:
-            pass
-        print('Start training...')
+        tf.compat.v1.logging.info('Start training...')
 
+        # 进入训练任务循环
         while 1:
-            shuffle_trains_idx = np.random.permutation(num_train_samples)
-            train_cost = 0
+
             start_time = time.time()
-            _avg_train_cost = 0
+            batch_cost = 65535
+            # 批次循环
             for cur_batch in range(num_batches_per_epoch):
+
+                if self.stop_flag:
+                    break
+
                 batch_time = time.time()
-                index_list = [
-                    shuffle_trains_idx[i % num_train_samples] for i in
-                    range(cur_batch * BATCH_SIZE, (cur_batch + 1) * BATCH_SIZE)
-                ]
-                if TRAINS_USE_TFRECORDS:
-                    batch_inputs, batch_seq_len, batch_labels = train_feeder.generate_batch_by_tfrecords(sess)
-                else:
-                    batch_inputs, batch_seq_len, batch_labels = train_feeder.generate_batch_by_files(index_list)
+
+                trains_batch = train_feeder.generate_batch_by_tfrecords(sess)
+
+                batch_inputs, batch_labels = trains_batch
 
                 feed = {
                     model.inputs: batch_inputs,
                     model.labels: batch_labels,
+                    model.utils.is_training: True
                 }
 
-                summary_str, batch_cost, step, _ = sess.run(
-                    [model.merged_summary, model.cost, model.global_step, model.train_op],
+                summary_str, batch_cost, step, _, seq_len = sess.run(
+                    [model.merged_summary, model.cost, model.global_step, model.train_op, model.seq_len],
                     feed_dict=feed
                 )
-                train_cost += batch_cost * BATCH_SIZE
-                avg_train_cost = train_cost / ((cur_batch + 1) * BATCH_SIZE)
-                _avg_train_cost = avg_train_cost
                 train_writer.add_summary(summary_str, step)
 
-                if step % 100 == 0 and step != 0:
-                    print('Step: {} Time: {:.3f} sec/batch, Cost = {:.5f}'.format(step, time.time() - batch_time, avg_train_cost))
+                if step % save_step == 0 and step != 0:
+                    tf.compat.v1.logging.info(
+                        'Step: {} Time: {:.3f} sec/batch, Cost = {:.8f}, BatchSize: {}, Shape[1]: {}'.format(
+                            step,
+                            time.time() - batch_time,
+                            batch_cost,
+                            len(batch_inputs),
+                            seq_len[0]
+                        )
+                    )
 
-                if step % TRAINS_SAVE_STEPS == 0 and step != 0:
-                    saver.save(sess, SAVE_MODEL, global_step=step)
-                    logger.info('save checkpoint at step {0}', format(step))
+                # 达到保存步数对模型过程进行存储
+                if step % save_step == 0 and step != 0:
+                    saver.save(sess, self.model_conf.save_model, global_step=step)
 
-                if step % TRAINS_VALIDATION_STEPS == 0 and step != 0:
-                    shuffle_test_idx = np.random.permutation(num_test_samples)
+                # 进入验证集验证环节
+                if step % trains_validation_steps == 0 and step != 0:
+
                     batch_time = time.time()
-                    index_test = [
-                        shuffle_test_idx[i % num_test_samples] for i in
-                        range(cur_batch * TEST_BATCH_SIZE, (cur_batch + 1) * TEST_BATCH_SIZE)
-                    ]
-                    if TRAINS_USE_TFRECORDS:
-                        test_inputs, batch_seq_len, test_labels = test_feeder.generate_batch_by_tfrecords(sess)
-                    else:
-                        test_inputs, batch_seq_len, test_labels = test_feeder.generate_batch_by_files(index_test)
+                    validation_batch = validation_feeder.generate_batch_by_tfrecords(sess)
 
+                    test_inputs, test_labels = validation_batch
                     val_feed = {
                         model.inputs: test_inputs,
-                        model.labels: test_labels
+                        model.labels: test_labels,
+                        model.utils.is_training: False
                     }
                     dense_decoded, lr = sess.run(
                         [model.dense_decoded, model.lrn_rate],
                         feed_dict=val_feed
                     )
-                    accuracy = utils.accuracy_calculation(
-                        test_feeder.labels(None if TRAINS_USE_TFRECORDS else index_test),
+                    # 计算准确率
+                    accuracy = self.validation.accuracy_calculation(
+                        validation_feeder.labels,
                         dense_decoded,
-                        ignore_value=[0, -1],
                     )
                     log = "Epoch: {}, Step: {}, Accuracy = {:.4f}, Cost = {:.5f}, " \
                           "Time = {:.3f} sec/batch, LearningRate: {}"
-                    print(log.format(
-                        epoch_count, step, accuracy, avg_train_cost, time.time() - batch_time, lr
+                    tf.compat.v1.logging.info(log.format(
+                        epoch_count,
+                        step,
+                        accuracy,
+                        batch_cost,
+                        time.time() - batch_time,
+                        lr / len(validation_batch),
                     ))
 
-                    if accuracy >= TRAINS_END_ACC and epoch_count >= TRAINS_END_EPOCHS and avg_train_cost <= TRAINS_END_COST:
+                    # 满足终止条件但尚未完成当前epoch时跳出epoch循环
+                    if self.achieve_cond(acc=accuracy, cost=batch_cost, epoch=epoch_count):
                         break
-            if accuracy >= TRAINS_END_ACC and epoch_count >= TRAINS_END_EPOCHS and _avg_train_cost <= TRAINS_END_COST:
-                compile_graph(accuracy)
-                print('Total Time: {} sec.'.format(time.time() - start_time))
+
+            # 满足终止条件时，跳出任务循环
+            if self.stop_flag:
+                break
+            if self.achieve_cond(acc=accuracy, cost=batch_cost, epoch=epoch_count):
+                # sess.close()
+                tf.compat.v1.keras.backend.clear_session()
+                sess.close()
+                self.compile_graph(accuracy)
+                tf.compat.v1.logging.info('Total Time: {} sec.'.format(time.time() - start_time))
+
                 break
             epoch_count += 1
+        tf.compat.v1.logging.info('Total Time: {} sec.'.format(time.time() - start_time))
 
 
-def generate_config(acc):
-    with open(MODEL_CONFIG_PATH, "r", encoding="utf8") as current_fp:
-        text = "".join(current_fp.readlines())
-        text = text.replace("ModelName: {}".format(TARGET_MODEL), "ModelName: {}_{}".format(TARGET_MODEL, int(acc * 10000)))
-    with open(os.path.join(OUTPUT_PATH, "{}_model.yaml".format(TARGET_MODEL)), "w", encoding="utf8") as save_fp:
-        save_fp.write(text)
-
-
-def main(_):
-    init()
-    train_process()
-    print('Training completed.')
+def main(argv):
+    project_name = argv[-1]
+    model_conf = ModelConfig(project_name=project_name)
+    Trains(model_conf).train_process()
+    tf.compat.v1.logging.info('Training completed.')
     pass
 
 
 if __name__ == '__main__':
-    tf.logging.set_verbosity(tf.logging.INFO)
-    tf.app.run()
+    # tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
+    tf.compat.v1.app.run()
